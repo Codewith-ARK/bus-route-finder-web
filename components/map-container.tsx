@@ -37,8 +37,11 @@ type BusMatch = {
   dropPoint?: [number, number];
 };
 
+type MapClickTarget = 'destination' | 'pickup';
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const ROUTE_COLORS = ['#e63946', '#2563eb', '#16a34a', '#9333ea', '#ea580c', '#0891b2'];
+const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? process.env.NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN ?? '';
 
 const emptyFeatureCollection = {
   type: 'FeatureCollection' as const,
@@ -50,6 +53,8 @@ const MapContainer = () => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const startMarkerRef = useRef<mapboxgl.Marker | null>(null);
   const destinationMarkerRef = useRef<mapboxgl.Marker | null>(null);
+  const matchMarkerRefs = useRef<mapboxgl.Marker[]>([]);
+  const mapClickTargetRef = useRef<MapClickTarget>('destination');
   const [availableRoutes, setAvailableRoutes] = useState<BusRoute[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [displayedRoutes, setDisplayedRoutes] = useState<BusRoute[]>([]);
@@ -59,6 +64,7 @@ const MapContainer = () => {
   const [startLat, setStartLat] = useState('');
   const [startLng, setStartLng] = useState('');
   const [destination, setDestination] = useState<Coordinate | null>(null);
+  const [mapClickTarget, setMapClickTarget] = useState<MapClickTarget>('destination');
   const [locationStatus, setLocationStatus] = useState('');
   const [searchLoading, setSearchLoading] = useState(false);
   const [matches, setMatches] = useState<BusMatch[]>([]);
@@ -89,7 +95,12 @@ const MapContainer = () => {
   }, []);
 
   useEffect(() => {
-    mapboxgl.setAccessToken('pk.eyJ1IjoiY29kZXJhcmsiLCJhIjoiY211bWs1Y3YwMDBweTJ3czl2cjFpd3g1aSJ9.630xcDNl9Xk1-bYLqTfQFA');
+    if (!MAPBOX_TOKEN) {
+      setError('Mapbox token is missing. Add NEXT_PUBLIC_MAPBOX_TOKEN to .env.local.');
+      return;
+    }
+
+    mapboxgl.setAccessToken(MAPBOX_TOKEN);
 
     if (!mapContainerRef.current) return;
 
@@ -100,12 +111,32 @@ const MapContainer = () => {
       zoom: 12,
     });
 
+    map.addControl(new mapboxgl.NavigationControl(), 'top-right');
+    const geolocateControl = new mapboxgl.GeolocateControl({
+      positionOptions: { enableHighAccuracy: true },
+      trackUserLocation: false,
+      showUserHeading: true,
+    });
+    geolocateControl.on('geolocate', ({ coords }) => {
+      setStartLat(coords.latitude.toFixed(6));
+      setStartLng(coords.longitude.toFixed(6));
+      setLocationStatus('Current location updated.');
+    });
+    map.addControl(geolocateControl, 'top-right');
+
     mapRef.current = map;
     map.on('load', () => {
       setMapReady(true);
       map.on('click', (event) => {
-        setDestination({ lat: event.lngLat.lat, lng: event.lngLat.lng });
-        setLocationStatus('Destination pin placed.');
+        const coordinate = { lat: event.lngLat.lat, lng: event.lngLat.lng };
+        if (mapClickTargetRef.current === 'pickup') {
+          setStartLat(coordinate.lat.toFixed(6));
+          setStartLng(coordinate.lng.toFixed(6));
+          setLocationStatus('Pickup point placed.');
+        } else {
+          setDestination(coordinate);
+          setLocationStatus('Drop-off point placed.');
+        }
       });
     });
 
@@ -113,6 +144,8 @@ const MapContainer = () => {
       setMapReady(false);
       map.remove();
       mapRef.current = null;
+      matchMarkerRefs.current.forEach((marker) => marker.remove());
+      matchMarkerRefs.current = [];
     };
   }, []);
 
@@ -205,6 +238,33 @@ const MapContainer = () => {
     if (!mapReady || !mapRef.current) return;
 
     const map = mapRef.current;
+    matchMarkerRefs.current.forEach((marker) => marker.remove());
+    matchMarkerRefs.current = [];
+
+    matches.forEach((match, index) => {
+      if (!match.boardPoint || !match.dropPoint) return;
+
+      const boardMarker = new mapboxgl.Marker({ color: '#16a34a' })
+        .setLngLat(match.boardPoint)
+        .setPopup(new mapboxgl.Popup({ offset: 16 }).setHTML(`<strong>${match.route}</strong><br />Pickup point`))
+        .addTo(map);
+      const dropMarker = new mapboxgl.Marker({ color: '#ea580c' })
+        .setLngLat(match.dropPoint)
+        .setPopup(new mapboxgl.Popup({ offset: 16 }).setHTML(`<strong>${match.route}</strong><br />Drop-off point`))
+        .addTo(map);
+      matchMarkerRefs.current.push(boardMarker, dropMarker);
+
+      const label = document.createElement('div');
+      label.className = 'route-label';
+      label.textContent = match.route;
+      label.style.backgroundColor = ROUTE_COLORS[index % ROUTE_COLORS.length];
+      const midpoint = match.geometry.coordinates[Math.floor(match.geometry.coordinates.length / 2)];
+      const routeLabel = new mapboxgl.Marker({ element: label, anchor: 'bottom' })
+        .setLngLat(midpoint)
+        .addTo(map);
+      matchMarkerRefs.current.push(routeLabel);
+    });
+
     const sourceData = {
       type: 'FeatureCollection' as const,
       features: matches.map((match, index) => ({
@@ -265,6 +325,12 @@ const MapContainer = () => {
 
   const toggleRoute = (id: string) => {
     setSelectedIds((current) => current.includes(id) ? current.filter((routeId) => routeId !== id) : [...current, id]);
+  };
+
+  const setClickTarget = (target: MapClickTarget) => {
+    mapClickTargetRef.current = target;
+    setMapClickTarget(target);
+    setLocationStatus(target === 'pickup' ? 'Click the map to place pickup.' : 'Click the map to place drop-off.');
   };
 
   const useCurrentLocation = () => {
@@ -351,11 +417,20 @@ const MapContainer = () => {
             <input value={startLat} onChange={(event) => setStartLat(event.target.value)} placeholder="Start lat" className="rounded-lg border border-slate-300 px-2 py-2 text-sm" />
             <input value={startLng} onChange={(event) => setStartLng(event.target.value)} placeholder="Start lng" className="rounded-lg border border-slate-300 px-2 py-2 text-sm" />
           </div>
-          <button type="button" onClick={useCurrentLocation} className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-            Use current location
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <button type="button" onClick={useCurrentLocation} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+              Use my location
+            </button>
+            <button type="button" onClick={() => setClickTarget('pickup')} className={`rounded-lg border px-3 py-2 text-sm font-medium ${mapClickTarget === 'pickup' ? 'border-blue-600 bg-blue-50 text-blue-700' : 'border-slate-300 text-slate-700 hover:bg-slate-50'}`}>
+              Pick on map
+            </button>
+          </div>
+          <button type="button" onClick={() => setClickTarget('destination')} className={`mt-2 w-full rounded-lg border px-3 py-2 text-sm font-medium ${mapClickTarget === 'destination' ? 'border-slate-950 bg-slate-50 text-slate-950' : 'border-slate-300 text-slate-700 hover:bg-slate-50'}`}>
+            Set drop-off on map
           </button>
-          <p className="mt-2 text-xs text-slate-500">Click anywhere on the map to drop your destination pin.</p>
-          {destination && <p className="mt-1 text-xs text-slate-600">Destination: {destination.lat.toFixed(5)}, {destination.lng.toFixed(5)}</p>}
+          <p className="mt-2 text-xs text-slate-500">Drag the map to explore. Use the top-right controls to zoom.</p>
+          {destination && <p className="mt-1 text-xs text-slate-600">Drop-off: {destination.lat.toFixed(5)}, {destination.lng.toFixed(5)}</p>}
+          {(startLat && startLng) && <p className="mt-1 text-xs text-slate-600">Pickup: {startLat}, {startLng}</p>}
           {locationStatus && <p className="mt-1 text-xs text-slate-600">{locationStatus}</p>}
           <button type="button" onClick={findSuitableRoutes} disabled={searchLoading} className="mt-3 w-full rounded-lg bg-slate-950 px-3 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
             {searchLoading ? 'Finding routes…' : 'Find suitable routes'}
